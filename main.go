@@ -100,7 +100,9 @@ func main() {
 
 	http.HandleFunc("/api/v1/signup", withCORS(srv.handleSignup))
 	http.HandleFunc("/api/v1/login", withCORS(srv.handleLogin))
-	http.HandleFunc("/api/v1/upload", withCORS(srv.handleUpload))
+	http.HandleFunc("/api/v1/upload", withCORS(srv.withAuth(srv.handleUpload)))
+	http.HandleFunc("/api/v1/files", withCORS(srv.withAuth(srv.handleListFiles)))
+
 
 	log.Printf("server listening on %s", addr)
 	log.Fatal(http.ListenAndServe(addr, nil))
@@ -226,7 +228,11 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	// (TODO: extract userID from JWT)
 	// for testing purpose here we use a fixed userID - alice test@1gmail.com
-	userID := "5b5fde48-13da-4cda-afbf-6b0e592f2ea0"
+	userID := getUserID(r)
+	if userID == "" {
+    http.Error(w, "unauthorized", http.StatusUnauthorized)
+    return
+	}
 
 	err := r.ParseMultipartForm(32 << 20) 
 	if err != nil {
@@ -325,11 +331,63 @@ func (s *Server) createJWT(userID, email string) (string, error) {
 	return signed, nil
 }
 
+
 func writeJSON(w http.ResponseWriter, v interface{}, status int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
+
+func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	userID := getUserID(r)
+	if userID == "" {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	ctx := r.Context()
+	rows, err := s.pool.Query(ctx, `
+		SELECT f.id, f.filename, f.mime, f.size, f.created_at,
+		       b.sha256, b.storage_key
+		FROM files f
+		JOIN blobs b ON f.blob_id = b.id
+		WHERE f.owner_id=$1
+		ORDER BY f.created_at DESC
+	`, userID)
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type FileMetadata struct {
+		ID         string `json:"id"`
+		Filename   string `json:"filename"`
+		Mime       string `json:"mime"`
+		Size       int64  `json:"size"`
+		UploadedAt time.Time `json:"uploaded_at"`
+		SHA256     string `json:"sha256"`
+		StorageKey string `json:"storage_key"`
+	}
+
+	var files []FileMetadata
+	for rows.Next() {
+		var f FileMetadata
+		if err := rows.Scan(&f.ID, &f.Filename, &f.Mime, &f.Size, &f.UploadedAt, &f.SHA256, &f.StorageKey); err != nil {
+			http.Error(w, "scan error", http.StatusInternalServerError)
+			return
+		}
+		files = append(files, f)
+	}
+
+	writeJSON(w, files, http.StatusOK)
+}
+
 
 func normalize(s string) string {
 	
