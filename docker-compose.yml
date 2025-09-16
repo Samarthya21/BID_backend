@@ -1,0 +1,12 @@
+services:
+  minio:
+    image: minio/minio
+    ports:
+      - "9100:9000"   # map host 9100 -> container 9000
+      - "9101:9001"   # map host 9101 -> container 9001
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - ./minio-data:/data
