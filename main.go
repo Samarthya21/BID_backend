@@ -13,11 +13,30 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
+
+	"crypto/sha256"
+	"fmt"
+	"io"
+	"mime/multipart"
+	
+
+	"github.com/minio/minio-go/v7"
+	"github.com/you/balkanid-auth/storage"
 )
 
+type UploadResponse struct {
+	FileID   string `json:"file_id"`
+	Filename string `json:"filename"`
+	BlobID   string `json:"blob_id"`
+	SHA256   string `json:"sha256"`
+	Size     int64  `json:"size"`
+	Mime     string `json:"mime"`
+	Deduped  bool   `json:"deduped"`
+}
 type Server struct {
 	pool      *pgxpool.Pool
 	jwtSecret string
+	minio     *storage.MinioClient
 }
 
 type SignupRequest struct {
@@ -38,6 +57,18 @@ type AuthResponse struct {
 	Name  string `json:"name,omitempty"`
 }
 
+func withCORS(next http.HandlerFunc) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000")
+        w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+        w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        if r.Method == http.MethodOptions {
+            w.WriteHeader(http.StatusNoContent)
+            return
+        }
+        next(w, r)
+    }
+}
 func main() {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
@@ -59,13 +90,17 @@ func main() {
 	}
 	defer pool.Close()
 
+	minioClient := storage.NewMinioClient()
+
 	srv := &Server{
 		pool:      pool,
 		jwtSecret: jwtSecret,
+		minio:     minioClient,
 	}
 
-	http.HandleFunc("/api/v1/signup", srv.handleSignup)
-	http.HandleFunc("/api/v1/login", srv.handleLogin)
+	http.HandleFunc("/api/v1/signup", withCORS(srv.handleSignup))
+	http.HandleFunc("/api/v1/login", withCORS(srv.handleLogin))
+	http.HandleFunc("/api/v1/upload", withCORS(srv.handleUpload))
 
 	log.Printf("server listening on %s", addr)
 	log.Fatal(http.ListenAndServe(addr, nil))
@@ -184,7 +219,94 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, resp, http.StatusOK)
 }
 
+func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// (TODO: extract userID from JWT)
+	// for testing purpose here we use a fixed userID - alice test@1gmail.com
+	userID := "5b5fde48-13da-4cda-afbf-6b0e592f2ea0"
 
+	err := r.ParseMultipartForm(32 << 20) 
+	if err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+
+	var responses []UploadResponse
+	for _, files := range r.MultipartForm.File {
+		for _, fh := range files {
+			res, err := s.saveFile(userID, fh)
+			if err != nil {
+				http.Error(w, "upload error: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			responses = append(responses, res)
+		}
+	}
+	writeJSON(w, responses, http.StatusOK)
+}
+
+func (s *Server) saveFile(userID string, fh *multipart.FileHeader) (UploadResponse, error) {
+	file, err := fh.Open()
+	if err != nil {
+		return UploadResponse{}, err
+	}
+	defer file.Close()
+
+	// compute sha256 + size
+	h := sha256.New()
+	size, err := io.Copy(h, file)
+	if err != nil {
+		return UploadResponse{}, err
+	}
+	sha := fmt.Sprintf("%x", h.Sum(nil))
+
+	// rewind file for upload
+	file.Seek(0, io.SeekStart)
+
+	// check if blob exists
+	ctx := context.Background()
+	var blobID string
+	
+	q := `SELECT id FROM blobs WHERE sha256=$1`
+	err = s.pool.QueryRow(ctx, q, sha).Scan(&blobID)
+	if err == nil {
+		
+		_, _ = s.pool.Exec(ctx, "UPDATE blobs SET ref_count = ref_count+1 WHERE id=$1", blobID)
+		fileID := uuid.New().String()
+		_, _ = s.pool.Exec(ctx, `INSERT INTO files (id, owner_id, blob_id, filename, mime, size) VALUES ($1,$2,$3,$4,$5,$6)`,
+			fileID, userID, blobID, fh.Filename, fh.Header.Get("Content-Type"), size)
+		return UploadResponse{FileID: fileID, Filename: fh.Filename, BlobID: blobID, SHA256: sha, Size: size, Mime: fh.Header.Get("Content-Type"), Deduped: true}, nil
+	}
+
+	
+	blobID = uuid.New().String()
+	storageKey := sha
+
+	_, err = s.minio.Client.PutObject(ctx, s.minio.Bucket, storageKey, file, size, minio.PutObjectOptions{
+		ContentType: fh.Header.Get("Content-Type"),
+	})
+	if err != nil {
+		return UploadResponse{}, err
+	}
+
+	_, err = s.pool.Exec(ctx, `INSERT INTO blobs (id, sha256, size, mime, storage_key) VALUES ($1,$2,$3,$4,$5)`,
+		blobID, sha, size, fh.Header.Get("Content-Type"), storageKey)
+	if err != nil {
+		return UploadResponse{}, err
+	}
+
+	fileID := uuid.New().String()
+	_, err = s.pool.Exec(ctx, `INSERT INTO files (id, owner_id, blob_id, filename, mime, size) VALUES ($1,$2,$3,$4,$5,$6)`,
+		fileID, userID, blobID, fh.Filename, fh.Header.Get("Content-Type"), size)
+	if err != nil {
+		return UploadResponse{}, err
+	}
+
+	return UploadResponse{FileID: fileID, Filename: fh.Filename, BlobID: blobID, SHA256: sha, Size: size, Mime: fh.Header.Get("Content-Type"), Deduped: false}, nil
+}
 
 func (s *Server) createJWT(userID, email string) (string, error) {
 	
