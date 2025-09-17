@@ -11,15 +11,17 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
+	
 	"golang.org/x/crypto/bcrypt"
 
+	"strings"
 	"crypto/sha256"
 	"fmt"
 	"io"
 	"mime/multipart"
 	
-
+	"github.com/jackc/pgx/v5"
+    "github.com/jackc/pgx/v5/pgxpool"
 	"github.com/minio/minio-go/v7"
 	"github.com/you/balkanid-auth/storage"
 )
@@ -60,7 +62,7 @@ type AuthResponse struct {
 func withCORS(next http.HandlerFunc) http.HandlerFunc {
     return func(w http.ResponseWriter, r *http.Request) {
         w.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000")
-        w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+        w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, DELETE")
         w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
         if r.Method == http.MethodOptions {
             w.WriteHeader(http.StatusNoContent)
@@ -102,6 +104,9 @@ func main() {
 	http.HandleFunc("/api/v1/login", withCORS(srv.handleLogin))
 	http.HandleFunc("/api/v1/upload", withCORS(srv.withAuth(srv.handleUpload)))
 	http.HandleFunc("/api/v1/files", withCORS(srv.withAuth(srv.handleListFiles)))
+	http.HandleFunc("/api/v1/delete/", withCORS(srv.withAuth(srv.handleDeleteFile)))
+
+	
 
 
 	log.Printf("server listening on %s", addr)
@@ -387,6 +392,94 @@ func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, files, http.StatusOK)
 }
+
+func (s *Server) handleDeleteFile(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	userID := getUserID(r)
+	if userID == "" {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Extract file ID from path
+	fileID := strings.TrimPrefix(r.URL.Path, "/api/v1/delete/")
+	if fileID == "" {
+		http.Error(w, "file id required", http.StatusBadRequest)
+		return
+	}
+
+	ctx := r.Context()
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// 1) Ensure file exists and belongs to this user, fetch blob info
+	var blobID, storageKey string
+	var refCount int
+	query := `
+		SELECT b.id, b.storage_key, b.ref_count
+		FROM files f
+		JOIN blobs b ON f.blob_id = b.id
+		WHERE f.id=$1 AND f.owner_id=$2
+		FOR UPDATE
+	`
+	if err := tx.QueryRow(ctx, query, fileID, userID).Scan(&blobID, &storageKey, &refCount); err != nil {
+		if err == pgx.ErrNoRows {
+			http.Error(w, "file not found or not owned by user", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+
+	// 2) Delete file row
+	if _, err := tx.Exec(ctx, `DELETE FROM files WHERE id=$1`, fileID); err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+
+	// 3) Update or delete blob row
+	if refCount > 1 {
+		if _, err := tx.Exec(ctx, `UPDATE blobs SET ref_count = ref_count - 1 WHERE id=$1`, blobID); err != nil {
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		if err := tx.Commit(ctx); err != nil {
+			http.Error(w, "db commit error", http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, map[string]any{"status": "deleted", "deduped": true}, http.StatusOK)
+		return
+	}
+
+	// refCount == 1 → delete blob
+	if _, err := tx.Exec(ctx, `DELETE FROM blobs WHERE id=$1`, blobID); err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		http.Error(w, "db commit error", http.StatusInternalServerError)
+		return
+	}
+
+	// 4) Remove from MinIO (async best-effort)
+	go func(bucket, key string) {
+		ctx2 := context.Background()
+		if err := s.minio.Client.RemoveObject(ctx2, bucket, key, minio.RemoveObjectOptions{}); err != nil {
+			log.Printf("minio delete error: %v", err)
+		}
+	}(s.minio.Bucket, storageKey)
+
+	writeJSON(w, map[string]any{"status": "deleted", "deduped": false}, http.StatusOK)
+}
+
 
 
 func normalize(s string) string {
