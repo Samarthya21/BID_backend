@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"os"
 	"time"
-
+	"sync"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	
@@ -39,6 +39,8 @@ type Server struct {
 	pool      *pgxpool.Pool
 	jwtSecret string
 	minio     *storage.MinioClient
+	rateLimits map[string]*RateLimiter
+	mu         sync.Mutex
 }
 
 type SignupRequest struct {
@@ -57,6 +59,14 @@ type AuthResponse struct {
 	ID    string `json:"id"`
 	Email string `json:"email"`
 	Name  string `json:"name,omitempty"`
+}
+
+type RateLimiter struct {
+    tokens      int
+    lastRefill  time.Time
+    maxTokens   int
+    refillRate  time.Duration
+	mu         sync.Mutex
 }
 
 func withCORS(next http.HandlerFunc) http.HandlerFunc {
@@ -98,17 +108,21 @@ func main() {
 		pool:      pool,
 		jwtSecret: jwtSecret,
 		minio:     minioClient,
+		rateLimits: make(map[string]*RateLimiter),
 	}
 
 	http.HandleFunc("/api/v1/signup", withCORS(srv.handleSignup))
 	http.HandleFunc("/api/v1/login", withCORS(srv.handleLogin))
-	http.HandleFunc("/api/v1/upload", withCORS(srv.withAuth(srv.handleUpload)))
-	http.HandleFunc("/api/v1/files", withCORS(srv.withAuth(srv.handleListFiles)))
-	http.HandleFunc("/api/v1/delete/", withCORS(srv.withAuth(srv.handleDeleteFile)))
-	http.HandleFunc("/api/v1/share/", withCORS(srv.withAuth(srv.handleShareFile)))	
+
+	http.HandleFunc("/api/v1/upload", withCORS(srv.withAuth(srv.withLimit(srv.handleUpload))))
+	http.HandleFunc("/api/v1/files", withCORS(srv.withAuth(srv.withLimit(srv.handleListFiles))))	
+	http.HandleFunc("/api/v1/delete/", withCORS(srv.withAuth(srv.withLimit(srv.handleDeleteFile))))
+	http.HandleFunc("/api/v1/share/", withCORS(srv.withAuth(srv.withLimit(srv.handleShareFile))))
+	http.HandleFunc("/api/v1/download/", withCORS(srv.withAuth(srv.withLimit(srv.handlePrivateDownload))))
+	http.HandleFunc("/api/v1/savings", withCORS(srv.withAuth(srv.withLimit(srv.handleSavings))))
+
+
 	http.HandleFunc("/api/v1/public/", withCORS(srv.handlePublicDownload))
-	http.HandleFunc("/api/v1/download/", withCORS(srv.withAuth(srv.handlePrivateDownload)))
-	http.HandleFunc("/api/v1/savings", withCORS(srv.withAuth(srv.handleSavings)))
 
 
 	
@@ -232,36 +246,58 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	// (TODO: extract userID from JWT)
-	// for testing purpose here we use a fixed userID - alice test@1gmail.com
-	userID := getUserID(r)
-	if userID == "" {
-    http.Error(w, "unauthorized", http.StatusUnauthorized)
-    return
-	}
+    if r.Method != http.MethodPost {
+        http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
 
-	err := r.ParseMultipartForm(32 << 20) 
-	if err != nil {
-		http.Error(w, "invalid form", http.StatusBadRequest)
-		return
-	}
+    userID := getUserID(r)
+    if userID == "" {
+        http.Error(w, "unauthorized", http.StatusUnauthorized)
+        return
+    }
 
-	var responses []UploadResponse
-	for _, files := range r.MultipartForm.File {
-		for _, fh := range files {
-			res, err := s.saveFile(userID, fh)
-			if err != nil {
-				http.Error(w, "upload error: "+err.Error(), http.StatusInternalServerError)
-				return
-			}
-			responses = append(responses, res)
-		}
-	}
-	writeJSON(w, responses, http.StatusOK)
+    ctx := r.Context()
+
+    // Parse upload
+    err := r.ParseMultipartForm(32 << 20) 
+    if err != nil {
+        http.Error(w, "invalid form", http.StatusBadRequest)
+        return
+    }
+
+    // Check storage already used
+    var used int64
+    err = s.pool.QueryRow(ctx, "SELECT COALESCE(SUM(size),0) FROM files WHERE owner_id=$1", userID).Scan(&used)
+    if err != nil {
+        http.Error(w, "db error", http.StatusInternalServerError)
+        return
+    }
+
+    var responses []UploadResponse
+
+    // Validate and save each file
+    for _, files := range r.MultipartForm.File {
+        for _, fh := range files {
+            // Quota check before saving
+            if used+fh.Size > defaultQuota {
+                http.Error(w, "storage quota exceeded (10 MB)", http.StatusForbidden)
+                return
+            }
+
+            // Save file to DB + MinIO
+            res, err := s.saveFile(userID, fh)
+            if err != nil {
+                http.Error(w, "upload error: "+err.Error(), http.StatusInternalServerError)
+                return
+            }
+
+            responses = append(responses, res)
+            used += fh.Size
+        }
+    }
+
+    writeJSON(w, responses, http.StatusOK)
 }
 
 func (s *Server) saveFile(userID string, fh *multipart.FileHeader) (UploadResponse, error) {
@@ -639,6 +675,57 @@ func (s *Server) handleSavings(w http.ResponseWriter, r *http.Request) {
 		"unique_blob_size": uniqueBlobSize,
 		"savings": savings,
 	}, http.StatusOK)
+}
+
+const (
+    defaultRateLimit = 2              // 2 requests/sec
+    defaultQuota     = 10 * 1024 * 1024 // 10 MB per user
+)
+
+func (s *Server) checkRateLimit(userID string) bool {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    rl, exists := s.rateLimits[userID]
+    if !exists {
+        rl = &RateLimiter{
+            tokens:     defaultRateLimit,
+            lastRefill: time.Now(),
+            maxTokens:  defaultRateLimit,
+            refillRate: time.Second,
+        }
+        s.rateLimits[userID] = rl
+    }
+
+    // refill tokens
+    elapsed := time.Since(rl.lastRefill)
+    if elapsed >= rl.refillRate {
+        rl.tokens = rl.maxTokens
+        rl.lastRefill = time.Now()
+    }
+
+    if rl.tokens > 0 {
+        rl.tokens--
+        return true
+    }
+    return false
+}
+
+func (s *Server) withLimit(next http.HandlerFunc) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        userID := getUserID(r)
+        if userID == "" {
+            http.Error(w, "unauthorized", http.StatusUnauthorized)
+            return
+        }
+
+        if !s.checkRateLimit(userID) {
+            http.Error(w, "rate limit exceeded (2 req/sec)", http.StatusTooManyRequests)
+            return
+        }
+
+        next(w, r)
+    }
 }
 
 func normalize(s string) string {
