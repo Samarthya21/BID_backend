@@ -105,6 +105,10 @@ func main() {
 	http.HandleFunc("/api/v1/upload", withCORS(srv.withAuth(srv.handleUpload)))
 	http.HandleFunc("/api/v1/files", withCORS(srv.withAuth(srv.handleListFiles)))
 	http.HandleFunc("/api/v1/delete/", withCORS(srv.withAuth(srv.handleDeleteFile)))
+	http.HandleFunc("/api/v1/share/", withCORS(srv.withAuth(srv.handleShareFile)))	
+	http.HandleFunc("/api/v1/public/", withCORS(srv.handlePublicDownload))
+	http.HandleFunc("/api/v1/download/", withCORS(srv.withAuth(srv.handlePrivateDownload)))
+
 
 	
 
@@ -480,6 +484,110 @@ func (s *Server) handleDeleteFile(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"status": "deleted", "deduped": false}, http.StatusOK)
 }
 
+func (s *Server) handleShareFile(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodPost {
+        http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+
+    userID := getUserID(r)
+    if userID == "" {
+        http.Error(w, "unauthorized", http.StatusUnauthorized)
+        return
+    }
+
+    fileID := strings.TrimPrefix(r.URL.Path, "/api/v1/share/")
+    if fileID == "" {
+        http.Error(w, "file id required", http.StatusBadRequest)
+        return
+    }
+
+    ctx := r.Context()
+    // Ensure file belongs to user
+    var exists bool
+    err := s.pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM files WHERE id=$1 AND owner_id=$2)", fileID, userID).Scan(&exists)
+    if err != nil || !exists {
+        http.Error(w, "file not found or unauthorized", http.StatusNotFound)
+        return
+    }
+
+    _, err = s.pool.Exec(ctx, "UPDATE files SET is_public=true WHERE id=$1", fileID)
+    if err != nil {
+        http.Error(w, "db error", http.StatusInternalServerError)
+        return
+    }
+
+    publicURL := fmt.Sprintf("http://localhost:8080/api/v1/public/%s", fileID)
+    writeJSON(w, map[string]string{"public_url": publicURL}, http.StatusOK)
+}
+
+func (s *Server) handlePublicDownload(w http.ResponseWriter, r *http.Request) {
+    fileID := strings.TrimPrefix(r.URL.Path, "/api/v1/public/")
+    if fileID == "" {
+        http.Error(w, "file id required", http.StatusBadRequest)
+        return
+    }
+
+    ctx := r.Context()
+    var storageKey, mime string
+    err := s.pool.QueryRow(ctx,
+        "SELECT b.storage_key, f.mime FROM files f JOIN blobs b ON f.blob_id=b.id WHERE f.id=$1 AND f.is_public=true",
+        fileID).Scan(&storageKey, &mime)
+    if err != nil {
+        http.Error(w, "file not public or not found", http.StatusNotFound)
+        return
+    }
+
+    // Increment download count
+    _, _ = s.pool.Exec(ctx, "UPDATE files SET download_count = download_count + 1 WHERE id=$1", fileID)
+
+    // Stream file from MinIO
+    obj, err := s.minio.Client.GetObject(ctx, s.minio.Bucket, storageKey, minio.GetObjectOptions{})
+    if err != nil {
+        http.Error(w, "minio fetch error", http.StatusInternalServerError)
+        return
+    }
+    defer obj.Close()
+
+    w.Header().Set("Content-Type", mime)
+    io.Copy(w, obj)
+}
+
+func (s *Server) handlePrivateDownload(w http.ResponseWriter, r *http.Request) {
+    userID := getUserID(r)
+    if userID == "" {
+        http.Error(w, "unauthorized", http.StatusUnauthorized)
+        return
+    }
+
+    fileID := strings.TrimPrefix(r.URL.Path, "/api/v1/download/")
+    if fileID == "" {
+        http.Error(w, "file id required", http.StatusBadRequest)
+        return
+    }
+
+    ctx := r.Context()
+    var storageKey, mime string
+    err := s.pool.QueryRow(ctx,
+        "SELECT b.storage_key, f.mime FROM files f JOIN blobs b ON f.blob_id=b.id WHERE f.id=$1 AND f.owner_id=$2",
+        fileID, userID).Scan(&storageKey, &mime)
+    if err != nil {
+        http.Error(w, "file not found or unauthorized", http.StatusNotFound)
+        return
+    }
+
+    _, _ = s.pool.Exec(ctx, "UPDATE files SET download_count = download_count + 1 WHERE id=$1", fileID)
+
+    obj, err := s.minio.Client.GetObject(ctx, s.minio.Bucket, storageKey, minio.GetObjectOptions{})
+    if err != nil {
+        http.Error(w, "minio fetch error", http.StatusInternalServerError)
+        return
+    }
+    defer obj.Close()
+
+    w.Header().Set("Content-Type", mime)
+    io.Copy(w, obj)
+}
 
 
 func normalize(s string) string {
