@@ -108,6 +108,7 @@ func main() {
 	http.HandleFunc("/api/v1/share/", withCORS(srv.withAuth(srv.handleShareFile)))	
 	http.HandleFunc("/api/v1/public/", withCORS(srv.handlePublicDownload))
 	http.HandleFunc("/api/v1/download/", withCORS(srv.withAuth(srv.handlePrivateDownload)))
+	http.HandleFunc("/api/v1/savings", withCORS(srv.withAuth(srv.handleSavings)))
 
 
 	
@@ -589,6 +590,56 @@ func (s *Server) handlePrivateDownload(w http.ResponseWriter, r *http.Request) {
     io.Copy(w, obj)
 }
 
+func (s *Server) handleSavings(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	userID := getUserID(r)
+	if userID == "" {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	ctx := r.Context()
+
+	// 1. Total size of all files by this user
+	var totalFileSize int64
+	err := s.pool.QueryRow(ctx, `SELECT COALESCE(SUM(size),0) FROM files WHERE owner_id=$1`, userID).Scan(&totalFileSize)
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+
+	// 2. Unique blob sizes for this user
+	// DISTINCT blob_id ensures duplicates aren’t double-counted
+	var uniqueBlobSize int64
+	err = s.pool.QueryRow(ctx, `
+    SELECT COALESCE(SUM(b.size),0)
+    FROM blobs b
+    WHERE b.id IN (
+        SELECT DISTINCT blob_id FROM files WHERE owner_id=$1
+    )
+`, userID).Scan(&uniqueBlobSize)
+	if err == pgx.ErrNoRows {
+		uniqueBlobSize = 0
+	} else if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+
+	savings := totalFileSize - uniqueBlobSize
+	if savings < 0 {
+		savings = 0
+	}
+
+	writeJSON(w, map[string]any{
+		"total_file_size": totalFileSize,
+		"unique_blob_size": uniqueBlobSize,
+		"savings": savings,
+	}, http.StatusOK)
+}
 
 func normalize(s string) string {
 	
