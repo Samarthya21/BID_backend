@@ -120,6 +120,10 @@ func main() {
 	http.HandleFunc("/api/v1/share/", withCORS(srv.withAuth(srv.withLimit(srv.handleShareFile))))
 	http.HandleFunc("/api/v1/download/", withCORS(srv.withAuth(srv.withLimit(srv.handlePrivateDownload))))
 	http.HandleFunc("/api/v1/savings", withCORS(srv.withAuth(srv.withLimit(srv.handleSavings))))
+	
+	http.HandleFunc("/api/v1/admin/stats", withCORS(srv.withAuth(srv.withAdmin(srv.handleAdminStats))))
+	http.HandleFunc("/api/v1/admin/files", withCORS(srv.withAuth(srv.withAdmin(srv.handleAdminListFiles))))
+
 
 
 	http.HandleFunc("/api/v1/public/", withCORS(srv.handlePublicDownload))
@@ -726,6 +730,111 @@ func (s *Server) withLimit(next http.HandlerFunc) http.HandlerFunc {
 
         next(w, r)
     }
+}
+
+
+
+// Middleware: check admin role
+func (s *Server) withAdmin(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		userID := getUserID(r)
+		if userID == "" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		ctx := r.Context()
+		var role string
+		err := s.pool.QueryRow(ctx, "SELECT role FROM users WHERE id=$1", userID).Scan(&role)
+		if err != nil || role != "admin" {
+			http.Error(w, "forbidden: admin only", http.StatusForbidden)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	}
+}
+
+// 1. Global Storage Stats
+func (s *Server) handleAdminStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx := r.Context()
+
+	// Total logical usage (sum of files)
+	var totalFiles int64
+	if err := s.pool.QueryRow(ctx, "SELECT COALESCE(SUM(size),0) FROM files").Scan(&totalFiles); err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+
+	// Deduplicated usage (unique blobs)
+	var totalBlobs int64
+	if err := s.pool.QueryRow(ctx, "SELECT COALESCE(SUM(size),0) FROM blobs").Scan(&totalBlobs); err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+
+	savings := totalFiles - totalBlobs
+	percent := float64(0)
+	if totalFiles > 0 {
+		percent = (float64(savings) / float64(totalFiles)) * 100
+	}
+
+	writeJSON(w, map[string]any{
+		"total_file_usage": totalFiles,
+		"deduped_usage":    totalBlobs,
+		"savings":          savings,
+		"savings_percent":  fmt.Sprintf("%.2f%%", percent),
+	}, http.StatusOK)
+}
+
+// 2. List all files with uploader details
+func (s *Server) handleAdminListFiles(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx := r.Context()
+	rows, err := s.pool.Query(ctx, `
+		SELECT f.id, f.filename, f.size, f.created_at,
+		       u.email, u.name, f.download_count
+		FROM files f
+		JOIN users u ON f.owner_id=u.id
+		ORDER BY f.created_at DESC
+	`)
+
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type AdminFile struct {
+		ID            string    `json:"id"`
+		Filename      string    `json:"filename"`
+		Size          int64     `json:"size"`
+		UploadedAt    time.Time `json:"uploaded_at"`
+		UploaderEmail string    `json:"uploader_email"`
+		UploaderName  string    `json:"uploader_name"`
+		DownloadCount int64     `json:"download_count"`
+	}
+
+	var files []AdminFile
+	for rows.Next() {
+		var f AdminFile
+		if err := rows.Scan(&f.ID, &f.Filename, &f.Size, &f.UploadedAt, &f.UploaderEmail, &f.UploaderName, &f.DownloadCount); err != nil {
+			http.Error(w, "scan error", http.StatusInternalServerError)
+			return
+		}
+		files = append(files, f)
+	}
+
+	writeJSON(w, files, http.StatusOK)
 }
 
 func normalize(s string) string {
